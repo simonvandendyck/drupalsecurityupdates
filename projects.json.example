@@ -4,7 +4,7 @@
     "repository": "git@gitlab.example.com:organization/project-name.git",
     "branch": "main",
     "auto_update": false,
-    "slack_webhook": "https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX"
+    "slack_webhook": "$SLACK_WEBHOOK_ANOTHER_PROJECT"
   },
   {
     "name": "My Drupal Project (Auto-detect latest release/* with auto_update and Slack notification)",
