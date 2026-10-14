@@ -1,0 +1,11 @@
+[
+  {
+    "name": "My Drupal Project (Fixed Branch)",
+    "repository": "git@gitlab.example.com:organization/project-name.git",
+    "branch": "main"
+  },
+  {
+    "name": "My Drupal Project (Auto-detect latest release/*)",
+    "repository": "git@gitlab.example.com:organization/another-project.git"
+  }
+]
