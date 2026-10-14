@@ -19,6 +19,10 @@ Le script inspecte une liste de dépôts, met à jour ou clone leurs sources, ex
 - **Consolidation par composant** :
   - Récupère la version actuellement installée depuis `composer.lock`.
   - Dédoublonne les avis pour n'afficher qu'une seule ligne par paquet à mettre à jour, complétée d'un volet rétractable (`<details>`) listant toutes les CVE associées.
+- **Auto-update et publication de branche** :
+  - Si `auto_update` est activé pour un projet et que des failles sont détectées, une branche `security-update/date` est créée, les paquets sont mis à niveau via `composer require`, commités et poussés sur le dépôt distant.
+- **Notifications Slack par projet** :
+  - Possibilité de spécifier un webhook Slack différent par projet (`slack_webhook`). Une notification riche est automatiquement envoyée sur le channel du projet lorsqu'une branche de mise à jour est créée et poussée.
 - **Rapports Markdown horodatés** :
   - Génération automatique de rapports structurés dans le dossier `reports/`.
 
@@ -41,21 +45,26 @@ Créez ou modifiez le fichier `projects.json` à la racine :
   {
     "name": "Mon Projet avec branche fixe",
     "repository": "git@gitlab.exemple.com:groupe/mon-projet.git",
-    "branch": "main"
+    "branch": "main",
+    "auto_update": false
   },
   {
-    "name": "Mon Projet avec détection release",
-    "repository": "git@gitlab.exemple.com:groupe/autre-projet.git"
+    "name": "Mon Projet avec auto-update et Slack",
+    "repository": "git@gitlab.exemple.com:groupe/autre-projet.git",
+    "auto_update": true,
+    "slack_webhook": "$SLACK_WEBHOOK_AUTRE_PROJET"
   }
 ]
 ```
 
-### Champs :
+### Champs de configuration :
 | Champ | Requis | Description |
 |---|---|---|
 | `name` | **Oui** | Nom identifiant le projet (utilisé pour le dossier local `projects/<name>`). |
 | `repository` | **Oui** | URL Git du dépôt (privilégier SSH, ex. `git@...`). |
 | `branch` | Non | Branche cible. Si omise, la branche `release/*` la plus récente est sélectionnée automatiquement. |
+| `auto_update` | Non | Booléen (`true`/`false`, défaut: `false`). Si activé et que des failles existent, crée la branche `security-update/date`, applique les mises à jour et pousse la branche sur origin. |
+| `slack_webhook` | Non | URL du webhook entrant Slack pour notifier le channel dédié du projet. Accepte une URL directe (`https://hooks.slack.com/...`) ou une variable d'environnement débutant par `$` (ex. `$SLACK_WEBHOOK_PROJET`). |
 
 ---
 
@@ -69,6 +78,11 @@ python3 main.py
 ### Spécifier un autre fichier de configuration
 ```bash
 python3 main.py --config mes-projets.json
+```
+
+### Forcer l'auto-update pour tous les projets nécessitant des mises à jour
+```bash
+python3 main.py --auto-update
 ```
 
 ### Auditer toutes les dépendances PHP (y compris outils tiers et vendors)
@@ -95,38 +109,41 @@ DrupalSecurityUpdates/
 ## Exemple de rapport généré
 
 ```markdown
-# Rapport de sécurité Drupal
+# Drupal Security Report
 
-Date : `2026-10-14 10:32:40`
-Périmètre : `Composants Drupal (drupal/*)`
+Date: `2026-10-14 11:01:06`
+Scope: `Drupal components (drupal/*)`
 
-## Résumé
+## Summary
 
-- Projets analysés : `4`
-- Projets nécessitant des mises à jour : `3`
-- Composants à mettre à jour : `6`
+- Projects analyzed: `4`
+- Projects requiring updates: `3`
+- Components to update: `6`
 
-## Détails
+## Details
 
 ### Mon Projet
 
-- Repository : `git@gitlab.exemple.com:groupe/mon-projet.git`
-- Branche : `release/2.2.12.1`
+- Repository: `git@gitlab.exemple.com:groupe/mon-projet.git`
+- Branch: `release/2.2.12.1`
 
-#### Mises à jour de sécurité requises
+> 🚀 **Auto-update successful:** Branch `security-update/2026-10-14` was created, committed, and pushed to origin.
+> - 💬 **Slack notification:** Sent to channel.
 
-> **Commande require combinée pour ce projet :**
+#### Required Security Updates
+
+> **Combined require command for this project:**
 > ```bash
 > composer require drupal/core-recommended:11.4.7 drupal/core-composer-scaffold:11.4.7 drupal/core-project-message:11.4.7 'drupal/webform:^6.3.1' --update-with-all-dependencies
 > ```
 
-| Package | Version actuelle | Versions affectées | Version cible | Commande Composer (require) | Avis principal | Lien |
+| Package | Current Version | Affected Versions | Target Version | Composer Command (require) | Primary Advisory | Link |
 |---|---|---|---|---|---|---|
-| `drupal/core` | `11.4.4` | `>=11.4.0 <11.4.7` | `11.4.7` | `composer require drupal/core-recommended:11.4.7 drupal/core-composer-scaffold:11.4.7 drupal/core-project-message:11.4.7 --update-with-all-dependencies` | Drupal core - Moderately critical - Third-party libraries - SA-CORE-2026-013 | [Voir](...) |
-| `drupal/webform` | `6.3.0-beta7` | `<6.2.12 \|\| >=6.3.0 <6.3.1` | `6.3.1` | `composer require 'drupal/webform:^6.3.1' --update-with-all-dependencies` | Webform - Critical - Remote Code Execution - SA-CONTRIB-2026-175 *(+19 autres failles)* | [Voir](...) |
+| `drupal/core` | `11.4.4` | `>=11.4.0 <11.4.7` | `11.4.7` | `composer require drupal/core-recommended:11.4.7 drupal/core-composer-scaffold:11.4.7 drupal/core-project-message:11.4.7 --update-with-all-dependencies` | Drupal core - Moderately critical - Third-party libraries - SA-CORE-2026-013 | [View](...) |
+| `drupal/webform` | `6.3.0-beta7` | `<6.2.12 \|\| >=6.3.0 <6.3.1` | `6.3.1` | `composer require 'drupal/webform:^6.3.1' --update-with-all-dependencies` | Webform - Critical - Remote Code Execution - SA-CONTRIB-2026-175 *(+19 other advisories)* | [View](...) |
 
 <details>
-<summary>Détail de toutes les failles détectées pour ce projet</summary>
+<summary>Detailed list of all detected advisories for this project</summary>
 ...
 </details>
 ```

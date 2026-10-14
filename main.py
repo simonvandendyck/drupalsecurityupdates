@@ -28,6 +28,7 @@ import os
 import re
 import shutil
 import subprocess
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -737,7 +738,104 @@ def get_project_require_command(updates, installed_packages):
     return f"composer require {' '.join(all_args)} --update-with-all-dependencies"
 
 
-def perform_auto_update(project_path, original_branch, updates, installed_packages, project_name=""):
+def send_slack_notification(webhook_url, project_name, branch_name, base_branch, updates, repository=""):
+    """
+    Send an automated notification to a project-specific Slack channel via Incoming Webhook.
+
+    Environment Variable Support:
+    -----------------------------
+    If `webhook_url` starts with '$' (e.g. '$SLACK_WEBHOOK_CCB'), the value is read from
+    os.environ to avoid storing sensitive webhook URLs directly in configuration files.
+
+    :param webhook_url: Slack incoming webhook URL or env variable name.
+    :param project_name: Name of the project.
+    :param branch_name: Created security-update branch name.
+    :param base_branch: Original source branch.
+    :param updates: List of package updates applied.
+    :param repository: Remote repository URL.
+    :return: Dict with 'success' and optional 'error' / 'status'.
+    """
+    if not webhook_url:
+        return {"success": False, "error": "No webhook URL specified."}
+
+    # Resolve environment variable if prefixed with '$'
+    if webhook_url.startswith("$"):
+        env_var = webhook_url[1:]
+        webhook_url = os.environ.get(env_var, "")
+        if not webhook_url:
+            return {
+                "success": False,
+                "error": f"Environment variable '{env_var}' is not set or empty.",
+            }
+
+    packages_lines = []
+    for u in updates:
+        pkg = u["package"]
+        cur = u.get("installed_version", "?")
+        target = u.get("target_version", "?")
+        packages_lines.append(f"• `{pkg}`: `{cur}` → `{target}`")
+
+    packages_text = "\n".join(packages_lines)
+
+    payload = {
+        "text": f"🚀 *[{project_name}]* New security update branch created: `{branch_name}`",
+        "blocks": [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": f"🛡️ Drupal Security Update: {project_name}",
+                    "emoji": True,
+                },
+            },
+            {
+                "type": "section",
+                "fields": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*Repository:*\n`{repository}`" if repository else f"*Project:*\n`{project_name}`",
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*Base Branch:*\n`{base_branch}`",
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*Created Branch:*\n`{branch_name}`",
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*Date:*\n`{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`",
+                    },
+                ],
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*Updated Packages:*\n{packages_text}",
+                },
+            },
+        ],
+    }
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        webhook_url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            status = resp.status
+            body = resp.read().decode("utf-8")
+            return {"success": status == 200, "status": status, "response": body}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def perform_auto_update(project_path, original_branch, updates, installed_packages, project_name="", repository="", slack_webhook=None):
     """
     Perform automated security updates on a dedicated Git branch and push to origin if successful.
 
@@ -870,11 +968,28 @@ def perform_auto_update(project_path, original_branch, updates, installed_packag
             "error": f"Push failed: {push_res['stderr'] or push_res['stdout']}",
         }
 
+    slack_res = None
+    if slack_webhook:
+        print(f"[{project_name}] Sending Slack notification to configured channel...")
+        slack_res = send_slack_notification(
+            webhook_url=slack_webhook,
+            project_name=project_name,
+            branch_name=branch_name,
+            base_branch=original_branch,
+            updates=updates,
+            repository=repository,
+        )
+        if slack_res.get("success"):
+            print(f"[{project_name}] Slack notification sent successfully.")
+        else:
+            print(f"[{project_name}] Failed to send Slack notification: {slack_res.get('error')}")
+
     print(f"[{project_name}] Successfully pushed '{branch_name}' to origin.")
     return {
         "success": True,
         "branch": branch_name,
         "commit": commit_msg,
+        "slack_notification": slack_res,
         "error": None,
     }
 
@@ -1002,9 +1117,17 @@ def generate_report(results, drupal_only=True):
         if auto_up:
             if auto_up.get("success"):
                 up_branch = auto_up.get("branch")
+                slack_info = auto_up.get("slack_notification")
+                slack_line = ""
+                if slack_info:
+                    if slack_info.get("success"):
+                        slack_line = "\n> - 💬 **Slack notification:** Sent to channel."
+                    else:
+                        slack_line = f"\n> - ⚠️ **Slack notification failed:** {slack_info.get('error')}"
+
                 lines.extend(
                     [
-                        f"> 🚀 **Auto-update successful:** Branch `{up_branch}` was created, committed, and pushed to origin.",
+                        f"> 🚀 **Auto-update successful:** Branch `{up_branch}` was created, committed, and pushed to origin.{slack_line}",
                         "",
                     ]
                 )
@@ -1167,6 +1290,8 @@ def analyze_project(project, drupal_only=True, auto_update=False):
             updates=result["updates"],
             installed_packages=installed_versions,
             project_name=project_name,
+            repository=project.get("repository", ""),
+            slack_webhook=project.get("slack_webhook"),
         )
         result["auto_update_result"] = auto_update_res
 

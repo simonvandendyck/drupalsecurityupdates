@@ -3,11 +3,13 @@
     "name": "My Drupal Project (Fixed Branch)",
     "repository": "git@gitlab.example.com:organization/project-name.git",
     "branch": "main",
-    "auto_update": false
+    "auto_update": false,
+    "slack_webhook": "https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX"
   },
   {
-    "name": "My Drupal Project (Auto-detect latest release/* with auto_update)",
+    "name": "My Drupal Project (Auto-detect latest release/* with auto_update and Slack notification)",
     "repository": "git@gitlab.example.com:organization/another-project.git",
-    "auto_update": true
+    "auto_update": true,
+    "slack_webhook": "$SLACK_WEBHOOK_ANOTHER_PROJECT"
   }
 ]
