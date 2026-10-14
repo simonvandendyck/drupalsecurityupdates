@@ -2,10 +2,12 @@
   {
     "name": "My Drupal Project (Fixed Branch)",
     "repository": "git@gitlab.example.com:organization/project-name.git",
-    "branch": "main"
+    "branch": "main",
+    "auto_update": false
   },
   {
-    "name": "My Drupal Project (Auto-detect latest release/*)",
-    "repository": "git@gitlab.example.com:organization/another-project.git"
+    "name": "My Drupal Project (Auto-detect latest release/* with auto_update)",
+    "repository": "git@gitlab.example.com:organization/another-project.git",
+    "auto_update": true
   }
 ]

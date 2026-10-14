@@ -737,6 +737,148 @@ def get_project_require_command(updates, installed_packages):
     return f"composer require {' '.join(all_args)} --update-with-all-dependencies"
 
 
+def perform_auto_update(project_path, original_branch, updates, installed_packages, project_name=""):
+    """
+    Perform automated security updates on a dedicated Git branch and push to origin if successful.
+
+    Workflow:
+    ---------
+    1. Formulate branch name: 'security-update/YYYY-MM-DD'.
+       If already exists locally, append timestamp suffix.
+    2. Check out new branch from the current clean base branch.
+    3. Run `composer require` with exact target versions.
+    4. If successful:
+       - Commit changes (composer.json, composer.lock, and any scaffolded assets).
+       - Push branch to remote repository (`git push -u origin <branch>`).
+       - Return to original base branch.
+       - Return success status.
+    5. If unsuccessful:
+       - Rollback changes (`git reset --hard`).
+       - Switch back to base branch and delete the temporary branch.
+       - Return error details.
+
+    :param project_path: Path to the local repository.
+    :param original_branch: Base branch that was checked out.
+    :param updates: List of package update dicts.
+    :param installed_packages: Dict of installed package names.
+    :param project_name: Project name for console logs.
+    :return: Dict with 'success', 'branch', and optional 'error' / 'commit'.
+    """
+    now = datetime.now()
+    base_branch_name = f"security-update/{now.strftime('%Y-%m-%d')}"
+    branch_name = base_branch_name
+
+    # Check if branch exists locally
+    check_branch = run_command(["git", "branch", "--list", branch_name], cwd=project_path)
+    if check_branch["stdout"].strip():
+        branch_name = f"security-update/{now.strftime('%Y-%m-%d-%H%M%S')}"
+
+    print(f"[{project_name}] Creating update branch '{branch_name}' from '{original_branch}'...")
+    checkout_res = run_command(["git", "checkout", "-b", branch_name], cwd=project_path)
+    if checkout_res["returncode"] != 0:
+        # Fallback with timestamp in case of naming conflict
+        branch_name = f"security-update/{now.strftime('%Y-%m-%d-%H%M%S')}"
+        checkout_res = run_command(["git", "checkout", "-b", branch_name], cwd=project_path)
+        if checkout_res["returncode"] != 0:
+            return {
+                "success": False,
+                "branch": branch_name,
+                "error": f"Failed to create branch '{branch_name}': {checkout_res['stderr'] or checkout_res['stdout']}",
+            }
+
+    # Extract raw package require arguments without shell quotes
+    all_raw_args = []
+    seen = set()
+    for u in updates:
+        args = get_package_require_args(
+            u["package"],
+            u.get("target_version"),
+            installed_packages,
+        )
+        for arg in args:
+            clean_arg = arg.strip("'\"")
+            if clean_arg not in seen:
+                seen.add(clean_arg)
+                all_raw_args.append(clean_arg)
+
+    if not all_raw_args:
+        run_command(["git", "checkout", original_branch], cwd=project_path)
+        return {
+            "success": False,
+            "branch": branch_name,
+            "error": "No packages to require.",
+        }
+
+    composer_cmd = ["composer", "require", *all_raw_args, "--update-with-all-dependencies", "--no-interaction"]
+    print(f"[{project_name}] Running: {' '.join(composer_cmd)}...")
+
+    require_res = run_command(composer_cmd, cwd=project_path)
+
+    if require_res["returncode"] != 0:
+        print(f"[{project_name}] Composer require failed. Rolling back changes...")
+        run_command(["git", "reset", "--hard"], cwd=project_path)
+        run_command(["git", "checkout", original_branch], cwd=project_path)
+        run_command(["git", "branch", "-D", branch_name], cwd=project_path)
+        return {
+            "success": False,
+            "branch": branch_name,
+            "error": require_res["stderr"] or require_res["stdout"],
+        }
+
+    # Check git status for modifications
+    status_res = run_command(["git", "status", "--porcelain"], cwd=project_path)
+    if not status_res["stdout"].strip():
+        print(f"[{project_name}] No changes detected after require. Returning to '{original_branch}'...")
+        run_command(["git", "checkout", original_branch], cwd=project_path)
+        run_command(["git", "branch", "-D", branch_name], cwd=project_path)
+        return {
+            "success": True,
+            "branch": branch_name,
+            "message": "Already up to date, no files were modified.",
+            "error": None,
+        }
+
+    print(f"[{project_name}] Committing changes on branch '{branch_name}'...")
+    run_command(["git", "add", "-A"], cwd=project_path)
+
+    packages_str = ", ".join([u["package"] for u in updates])
+    commit_msg = f"Security updates: {packages_str}"
+    commit_res = run_command(["git", "commit", "-m", commit_msg], cwd=project_path)
+
+    if commit_res["returncode"] != 0:
+        print(f"[{project_name}] Commit failed. Rolling back...")
+        run_command(["git", "reset", "--hard"], cwd=project_path)
+        run_command(["git", "checkout", original_branch], cwd=project_path)
+        run_command(["git", "branch", "-D", branch_name], cwd=project_path)
+        return {
+            "success": False,
+            "branch": branch_name,
+            "error": f"Failed to commit changes: {commit_res['stderr'] or commit_res['stdout']}",
+        }
+
+    print(f"[{project_name}] Pushing branch '{branch_name}' to origin...")
+    push_res = run_command(["git", "push", "-u", "origin", branch_name], cwd=project_path)
+
+    # Always return to original branch
+    run_command(["git", "checkout", original_branch], cwd=project_path)
+
+    if push_res["returncode"] != 0:
+        print(f"[{project_name}] Push failed!")
+        return {
+            "success": False,
+            "branch": branch_name,
+            "error": f"Push failed: {push_res['stderr'] or push_res['stdout']}",
+        }
+
+    print(f"[{project_name}] Successfully pushed '{branch_name}' to origin.")
+    return {
+        "success": True,
+        "branch": branch_name,
+        "commit": commit_msg,
+        "error": None,
+    }
+
+
 def generate_report(results, drupal_only=True):
     """
     Generate a comprehensive, structured Markdown report from the audit results.
@@ -855,6 +997,26 @@ def generate_report(results, drupal_only=True):
             )
             continue
 
+        # Auto-update status block if executed
+        auto_up = result.get("auto_update_result")
+        if auto_up:
+            if auto_up.get("success"):
+                up_branch = auto_up.get("branch")
+                lines.extend(
+                    [
+                        f"> 🚀 **Auto-update successful:** Branch `{up_branch}` was created, committed, and pushed to origin.",
+                        "",
+                    ]
+                )
+            else:
+                err_msg = auto_up.get("error", "Unknown error")
+                lines.extend(
+                    [
+                        f"> ❌ **Auto-update failed:** `{err_msg}`",
+                        "",
+                    ]
+                )
+
         # Combined command for updating all packages at once
         installed_packages = result.get("installed_packages", {})
         combined_cmd = get_project_require_command(updates, installed_packages)
@@ -921,7 +1083,7 @@ def generate_report(results, drupal_only=True):
     return report_path
 
 
-def analyze_project(project, drupal_only=True):
+def analyze_project(project, drupal_only=True, auto_update=False):
     """
     Coordinate the end-to-end security analysis for a single project.
 
@@ -996,6 +1158,18 @@ def analyze_project(project, drupal_only=True):
         drupal_only=drupal_only,
     )
 
+    should_auto_update = auto_update or project.get("auto_update", False)
+    if should_auto_update and result["updates"]:
+        print(f"[{project_name}] 'auto_update' is enabled. Initiating automated branch creation and update...")
+        auto_update_res = perform_auto_update(
+            project_path=project_path,
+            original_branch=detected_branch,
+            updates=result["updates"],
+            installed_packages=installed_versions,
+            project_name=project_name,
+        )
+        result["auto_update_result"] = auto_update_res
+
     return result
 
 
@@ -1020,6 +1194,12 @@ def main():
         help="Audit all third-party PHP packages instead of targeting only Drupal packages (drupal/*).",
     )
 
+    parser.add_argument(
+        "--auto-update",
+        action="store_true",
+        help="Enable automated branch creation, update execution, and publication for projects requiring updates.",
+    )
+
     args = parser.parse_args()
     config_path = Path(args.config)
     drupal_only = not args.all_packages
@@ -1037,7 +1217,11 @@ def main():
     results = []
 
     for project in projects:
-        result = analyze_project(project, drupal_only=drupal_only)
+        result = analyze_project(
+            project,
+            drupal_only=drupal_only,
+            auto_update=args.auto_update,
+        )
         results.append(result)
 
     report_path = generate_report(results, drupal_only=drupal_only)
