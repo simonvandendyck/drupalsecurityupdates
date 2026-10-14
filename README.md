@@ -82,11 +82,12 @@ python3 main.py --all-packages
 
 ```text
 DrupalSecurityUpdates/
-├── main.py              # Script principal d'audit et de génération de rapport
-├── projects.json        # Liste des projets à surveiller
-├── README.md            # Documentation du projet
-├── projects/            # Dépôts Git clonés et mis à jour localement
-└── reports/             # Rapports d'audit Markdown générés (report-AAAA-MM-JJ-HH-MM-SS.md)
+├── main.py                  # Script principal d'audit et de génération de rapport
+├── projects.json.example    # Modèle d'exemple de configuration
+├── projects.json            # Configuration locale (ignorée par Git)
+├── README.md                # Documentation du projet
+├── projects/                # Dépôts Git clonés et mis à jour localement (ignoré)
+└── reports/                 # Rapports d'audit Markdown générés (ignoré sauf .gitkeep)
 ```
 
 ---
@@ -114,10 +115,15 @@ Périmètre : `Composants Drupal (drupal/*)`
 
 #### Mises à jour de sécurité requises
 
-| Package | Version actuelle | Versions affectées | Avis principal | Lien |
-|---|---|---|---|---|
-| `drupal/core` | `11.4.4` | `>=11.4.0 <11.4.7` | Drupal core - Moderately critical - Third-party libraries - SA-CORE-2026-013 | [Voir](...) |
-| `drupal/webform` | `6.3.0-beta7` | `<6.2.12 \|\| >=6.3.0 <6.3.1` | Webform - Critical - Remote Code Execution - SA-CONTRIB-2026-175 *(+19 autres failles)* | [Voir](...) |
+> **Commande require combinée pour ce projet :**
+> ```bash
+> composer require drupal/core-recommended:11.4.7 drupal/core-composer-scaffold:11.4.7 drupal/core-project-message:11.4.7 'drupal/webform:^6.3.1' --update-with-all-dependencies
+> ```
+
+| Package | Version actuelle | Versions affectées | Version cible | Commande Composer (require) | Avis principal | Lien |
+|---|---|---|---|---|---|---|
+| `drupal/core` | `11.4.4` | `>=11.4.0 <11.4.7` | `11.4.7` | `composer require drupal/core-recommended:11.4.7 drupal/core-composer-scaffold:11.4.7 drupal/core-project-message:11.4.7 --update-with-all-dependencies` | Drupal core - Moderately critical - Third-party libraries - SA-CORE-2026-013 | [Voir](...) |
+| `drupal/webform` | `6.3.0-beta7` | `<6.2.12 \|\| >=6.3.0 <6.3.1` | `6.3.1` | `composer require 'drupal/webform:^6.3.1' --update-with-all-dependencies` | Webform - Critical - Remote Code Execution - SA-CONTRIB-2026-175 *(+19 autres failles)* | [Voir](...) |
 
 <details>
 <summary>Détail de toutes les failles détectées pour ce projet</summary>

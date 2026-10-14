@@ -491,6 +491,79 @@ def run_composer_audit(project_path):
     }
 
 
+def parse_num_version(v):
+    """
+    Parse a version string into a comparable tuple of integers (e.g. '11.4.4' -> (11, 4, 4, 0)).
+    """
+    if not v or v == "-":
+        return (0, 0, 0, 0)
+    clean = re.split(r"[-+]", v)[0]
+    parts = []
+    for p in clean.split("."):
+        if p.isdigit():
+            parts.append(int(p))
+        else:
+            break
+    while len(parts) < 4:
+        parts.append(0)
+    return tuple(parts[:4])
+
+
+def determine_target_version(installed_ver, affected_constraints_list):
+    """
+    Deduce the minimum safe target version that resolves the vulnerabilities.
+
+    Logic:
+    ------
+    From the list of affected version constraints (e.g. '<6.2.12 || >=6.3.0 <6.3.1'):
+    1. Parse clauses and identify upper-bound limits (<X.Y.Z).
+    2. Prioritize candidate boundaries matching the currently installed major.minor branch.
+    3. Return the exact safe version that exceeds the vulnerable range.
+
+    :param installed_ver: Currently installed version string (e.g. '6.3.0-beta7').
+    :param affected_constraints_list: List of affected version expressions from advisories.
+    :return: Recommended target version string (e.g. '6.3.1') or None.
+    """
+    if not installed_ver or installed_ver == "-":
+        return None
+
+    inst_tuple = parse_num_version(installed_ver)
+    candidate_targets = []
+
+    for full_constraint in affected_constraints_list:
+        clauses = re.split(r"\|\||\|", full_constraint)
+        for clause in clauses:
+            clause = clause.strip()
+            lower_m = re.search(r">=?\s*([0-9]+(?:\.[0-9]+)*(?:-[a-zA-Z0-9.]+)?)\b", clause)
+            upper_m = re.search(r"<\s*([0-9]+(?:\.[0-9]+)*(?:-[a-zA-Z0-9.]+)?)\b", clause)
+
+            lower_v = lower_m.group(1) if lower_m else None
+            upper_v = upper_m.group(1) if upper_m else None
+
+            if upper_v:
+                up_tuple = parse_num_version(upper_v)
+                low_tuple = parse_num_version(lower_v) if lower_v else (0, 0, 0, 0)
+
+                # Priority 1: same major and minor branch (e.g. installed 6.3.x and upper bound 6.3.1)
+                if (inst_tuple[0], inst_tuple[1]) == (up_tuple[0], up_tuple[1]):
+                    candidate_targets.append((1, up_tuple, upper_v))
+                # Priority 2: same major, installed is lower
+                elif inst_tuple[0] == up_tuple[0] and inst_tuple < up_tuple:
+                    candidate_targets.append((2, up_tuple, upper_v))
+                # Priority 3: falls between lower and upper
+                elif low_tuple <= inst_tuple < up_tuple:
+                    candidate_targets.append((3, up_tuple, upper_v))
+                else:
+                    candidate_targets.append((4, up_tuple, upper_v))
+
+    if not candidate_targets:
+        return None
+
+    # Sort: lowest priority rank first, then highest version numbers
+    candidate_targets.sort(key=lambda x: (x[0], -x[1][0], -x[1][1], -x[1][2], -x[1][3]))
+    return candidate_targets[0][2]
+
+
 def extract_package_updates(audit_data, installed_versions, drupal_only=True):
     """
     Process raw audit data into clean, consolidated package update recommendations.
@@ -499,10 +572,9 @@ def extract_package_updates(audit_data, installed_versions, drupal_only=True):
     -------------------------------
     `composer audit` outputs one advisory per CVE. If a package (like `drupal/webform`)
     has 20 past CVEs, raw output repeats the package 20 times.
-    In practice, a single `composer update drupal/webform` resolves all of them.
+    In practice, a single `composer require` resolves all of them.
     This function groups all advisories by package, displays the installed version,
-    the affected version range, the most recent advisory, and attaches the complete list
-    of individual advisories for deep traceability.
+    the affected version range, the deduced target safe version, and the most recent advisory.
 
     Handling Composer JSON Structure:
     ---------------------------------
@@ -547,6 +619,9 @@ def extract_package_updates(audit_data, installed_versions, drupal_only=True):
                 affected_list.append(aff)
         affected_versions = " ; ".join(affected_list) if affected_list else "-"
 
+        # Deduce the exact target safe version
+        target_version = determine_target_version(installed_version, affected_list)
+
         # Sort advisories by report date in descending order (most recent first)
         sorted_advisories = sorted(
             valid_advisories,
@@ -555,7 +630,7 @@ def extract_package_updates(audit_data, installed_versions, drupal_only=True):
         )
 
         main_advisory = sorted_advisories[0]
-        main_title = main_advisory.get("title", "Sans titre")
+        main_title = main_advisory.get("title", "Untitled")
         main_link = main_advisory.get("link", "")
 
         package_updates.append(
@@ -563,12 +638,13 @@ def extract_package_updates(audit_data, installed_versions, drupal_only=True):
                 "package": package_name,
                 "installed_version": installed_version,
                 "affected_versions": affected_versions,
+                "target_version": target_version,
                 "total_advisories": len(valid_advisories),
                 "main_title": main_title,
                 "main_link": main_link,
                 "all_advisories": [
                     {
-                        "title": adv.get("title", "Sans titre"),
+                        "title": adv.get("title", "Untitled"),
                         "cve": adv.get("cve", ""),
                         "link": adv.get("link", ""),
                         "affected_versions": adv.get("affectedVersions", ""),
@@ -583,6 +659,84 @@ def extract_package_updates(audit_data, installed_versions, drupal_only=True):
     return package_updates
 
 
+def get_package_require_args(package_name, target_version, installed_packages):
+    """
+    Build the exact CLI argument(s) for a package to be updated via `composer require`.
+
+    Drupal Core Special Handling:
+    -----------------------------
+    If the project uses `drupal/core-recommended`, Drupal best practices require
+    updating `core-recommended`, `core-composer-scaffold`, and `core-project-message`
+    together to identical pinned versions.
+
+    Contrib Modules:
+    ----------------
+    Contrib modules use caret constraints (e.g. `'drupal/webform:^6.3.1'`).
+
+    :param package_name: Name of the package (e.g. 'drupal/core' or 'drupal/webform').
+    :param target_version: Deduce target version (e.g. '11.4.7' or '6.3.1').
+    :param installed_packages: Dict of installed package names in the project.
+    :return: List of package:version argument strings.
+    """
+    if package_name in ("drupal/core", "drupal/core-recommended"):
+        ver = target_version or "latest"
+        if "drupal/core-recommended" in installed_packages:
+            args = [f"drupal/core-recommended:{ver}"]
+            if "drupal/core-composer-scaffold" in installed_packages:
+                args.append(f"drupal/core-composer-scaffold:{ver}")
+            if "drupal/core-project-message" in installed_packages:
+                args.append(f"drupal/core-project-message:{ver}")
+            return args
+        else:
+            return [f"'drupal/core:^{ver}'" if target_version else "drupal/core"]
+
+    if target_version:
+        return [f"'{package_name}:^{target_version}'"]
+    return [package_name]
+
+
+def get_package_require_command(package_name, target_version, installed_packages):
+    """
+    Generate the precise `composer require` CLI command for an individual package.
+
+    :param package_name: Name of the package.
+    :param target_version: Deduced safe version.
+    :param installed_packages: Dict of all installed package names.
+    :return: Formatted Composer CLI command string.
+    """
+    args = get_package_require_args(package_name, target_version, installed_packages)
+    return f"composer require {' '.join(args)} --update-with-all-dependencies"
+
+
+def get_project_require_command(updates, installed_packages):
+    """
+    Generate a single combined `composer require` command with all required security
+    updates for the entire project.
+
+    :param updates: List of package update dictionaries.
+    :param installed_packages: Dict of all installed package names in the project.
+    :return: Combined Composer CLI command string.
+    """
+    all_args = []
+    seen = set()
+
+    for u in updates:
+        args = get_package_require_args(
+            u["package"],
+            u.get("target_version"),
+            installed_packages,
+        )
+        for arg in args:
+            if arg not in seen:
+                seen.add(arg)
+                all_args.append(arg)
+
+    if not all_args:
+        return ""
+
+    return f"composer require {' '.join(all_args)} --update-with-all-dependencies"
+
+
 def generate_report(results, drupal_only=True):
     """
     Generate a comprehensive, structured Markdown report from the audit results.
@@ -595,7 +749,8 @@ def generate_report(results, drupal_only=True):
        - Repository & active Branch.
        - Execution errors if any.
        - Missing Composer file warnings if any.
-       - Clean, consolidated table of packages to update (Package, Installed, Affected, Primary Advisory, Link).
+       - Combined Composer command to update all project packages at once.
+       - Clean, consolidated table of packages to update (Package, Installed, Affected, Update Command, Primary Advisory, Link).
        - Collapsible `<details>` section containing every individual CVE/advisory with links.
 
     Markdown Table Safety:
@@ -621,21 +776,21 @@ def generate_report(results, drupal_only=True):
         len(result.get("updates", [])) for result in results
     )
 
-    scope_text = "Composants Drupal (`drupal/*`)" if drupal_only else "Tous les packages"
+    scope_text = "Drupal components (`drupal/*`)" if drupal_only else "All packages"
 
     lines = [
-        "# Rapport de sécurité Drupal",
+        "# Drupal Security Report",
         "",
-        f"Date : `{now.strftime('%Y-%m-%d %H:%M:%S')}`",
-        f"Périmètre : `{scope_text}`",
+        f"Date: `{now.strftime('%Y-%m-%d %H:%M:%S')}`",
+        f"Scope: `{scope_text}`",
         "",
-        "## Résumé",
+        "## Summary",
         "",
-        f"- Projets analysés : `{total_projects}`",
-        f"- Projets nécessitant des mises à jour : `{projects_with_updates}`",
-        f"- Composants à mettre à jour : `{total_packages_to_update}`",
+        f"- Projects analyzed: `{total_projects}`",
+        f"- Projects requiring updates: `{projects_with_updates}`",
+        f"- Components to update: `{total_packages_to_update}`",
         "",
-        "## Détails",
+        "## Details",
         "",
     ]
 
@@ -648,8 +803,8 @@ def generate_report(results, drupal_only=True):
             [
                 f"### {project_name}",
                 "",
-                f"- Repository : `{repository}`",
-                f"- Branche : `{branch}`",
+                f"- Repository: `{repository}`",
+                f"- Branch: `{branch}`",
                 "",
             ]
         )
@@ -658,7 +813,7 @@ def generate_report(results, drupal_only=True):
         if result.get("error"):
             lines.extend(
                 [
-                    "#### Erreur",
+                    "#### Error",
                     "",
                     "```text",
                     result["error"],
@@ -672,7 +827,7 @@ def generate_report(results, drupal_only=True):
         if not result.get("composer_json_exists"):
             lines.extend(
                 [
-                    "⚠️ Aucun fichier `composer.json` trouvé.",
+                    "⚠️ No `composer.json` file found.",
                     "",
                 ]
             )
@@ -682,7 +837,7 @@ def generate_report(results, drupal_only=True):
         if not result.get("composer_lock_exists"):
             lines.extend(
                 [
-                    "⚠️ Aucun fichier `composer.lock` trouvé.",
+                    "⚠️ No `composer.lock` file found.",
                     "",
                 ]
             )
@@ -694,19 +849,26 @@ def generate_report(results, drupal_only=True):
         if not updates:
             lines.extend(
                 [
-                    "✅ Aucune mise à jour de sécurité Drupal requise.",
+                    "✅ No Drupal security updates required.",
                     "",
                 ]
             )
             continue
 
+        # Combined command for updating all packages at once
+        installed_packages = result.get("installed_packages", {})
+        combined_cmd = get_project_require_command(updates, installed_packages)
+
         # Table of required package updates
         lines.extend(
             [
-                "#### Mises à jour de sécurité requises",
+                "#### Required Security Updates",
                 "",
-                "| Package | Version actuelle | Versions affectées | Avis principal | Lien |",
-                "|---|---|---|---|---|",
+                "> **Combined require command for this project:**",
+                f"> ```bash\n> {combined_cmd}\n> ```",
+                "",
+                "| Package | Current Version | Affected Versions | Target Version | Composer Command (require) | Primary Advisory | Link |",
+                "|---|---|---|---|---|---|---|",
             ]
         )
 
@@ -715,19 +877,21 @@ def generate_report(results, drupal_only=True):
             installed = update["installed_version"]
             # Escape pipe symbols to prevent breaking markdown tables
             affected = str(update["affected_versions"]).replace("|", "\\|")
+            target_ver = update.get("target_version") or "-"
+            update_cmd = f"`{get_package_require_command(package, update.get('target_version'), installed_packages)}`"
 
             count = update["total_advisories"]
             main_title = str(update["main_title"]).replace("|", "\\|")
             if count > 1:
-                title_display = f"{main_title} *(+{count - 1} autre{'s' if count > 2 else ''} faille{'s' if count > 2 else ''})*"
+                title_display = f"{main_title} *(+{count - 1} other{'s' if count > 2 else ''} advisory/advisories)*"
             else:
                 title_display = main_title
 
             link = update["main_link"] or "-"
-            link_display = f"[Voir]({link})" if link != "-" else "-"
+            link_display = f"[View]({link})" if link != "-" else "-"
 
             lines.append(
-                f"| `{package}` | `{installed}` | `{affected}` | {title_display} | {link_display} |"
+                f"| `{package}` | `{installed}` | `{affected}` | `{target_ver}` | {update_cmd} | {title_display} | {link_display} |"
             )
 
         lines.append("")
@@ -736,17 +900,17 @@ def generate_report(results, drupal_only=True):
         lines.extend(
             [
                 "<details>",
-                "<summary>Détail de toutes les failles détectées pour ce projet</summary>",
+                "<summary>Detailed list of all detected advisories for this project</summary>",
                 "",
             ]
         )
         for update in updates:
-            lines.append(f"**`{update['package']}`** ({update['total_advisories']} avis) :")
+            lines.append(f"**`{update['package']}`** ({update['total_advisories']} advisories):")
             lines.append("")
             for adv in update["all_advisories"]:
                 adv_title = adv["title"]
                 adv_cve = f" - `{adv['cve']}`" if adv.get("cve") else ""
-                adv_link = f" - [Lien]({adv['link']})" if adv.get("link") else ""
+                adv_link = f" - [Link]({adv['link']})" if adv.get("link") else ""
                 lines.append(f"- {adv_title}{adv_cve}{adv_link}")
             lines.append("")
         lines.extend(["</details>", ""])
@@ -774,7 +938,7 @@ def analyze_project(project, drupal_only=True):
     """
     project_name = project["name"]
 
-    print(f"\nAnalyse du projet : {project_name}")
+    print(f"\nAnalyzing project: {project_name}")
 
     clone_result = clone_or_update_project(project)
 
@@ -803,24 +967,25 @@ def analyze_project(project, drupal_only=True):
     result["composer_lock_exists"] = composer_lock_exists
 
     if not composer_json_exists:
-        result["error"] = "Le fichier composer.json est introuvable."
+        result["error"] = "composer.json file not found."
         return result
 
     if not composer_lock_exists:
-        result["error"] = "Le fichier composer.lock est introuvable."
+        result["error"] = "composer.lock file not found."
         return result
 
     # Read installed package versions from composer.lock
     installed_versions = get_installed_versions(project_path)
+    result["installed_packages"] = installed_versions
 
-    print(f"[{project_name}] Exécution de composer audit...")
+    print(f"[{project_name}] Running composer audit...")
 
     audit_result = run_composer_audit(project_path)
 
     if not audit_result["success"]:
         result["error"] = (
             audit_result["error"]
-            or "Erreur inconnue lors de l'exécution de composer audit."
+            or "Unknown error while executing composer audit."
         )
         return result
 
@@ -840,19 +1005,19 @@ def main():
     Parses arguments, initializes directories, processes projects, and generates the report.
     """
     parser = argparse.ArgumentParser(
-        description="Analyse les mises à jour de sécurité de projets Drupal via Composer."
+        description="Audit Drupal project security updates via Composer."
     )
 
     parser.add_argument(
         "--config",
         default="projects.json",
-        help="Chemin vers le fichier JSON contenant la liste des projets (défaut : projects.json).",
+        help="Path to JSON configuration file containing the list of projects (default: projects.json).",
     )
 
     parser.add_argument(
         "--all-packages",
         action="store_true",
-        help="Analyser tous les packages PHP tiers au lieu de cibler uniquement les packages Drupal (drupal/*).",
+        help="Audit all third-party PHP packages instead of targeting only Drupal packages (drupal/*).",
     )
 
     args = parser.parse_args()
@@ -861,7 +1026,7 @@ def main():
 
     if not config_path.exists():
         raise FileNotFoundError(
-            f"Le fichier de configuration est introuvable : {config_path}"
+            f"Configuration file not found: {config_path}"
         )
 
     # Ensure output directories exist
@@ -878,7 +1043,7 @@ def main():
     report_path = generate_report(results, drupal_only=drupal_only)
 
     print("")
-    print(f"Rapport généré : {report_path}")
+    print(f"Report generated: {report_path}")
 
 
 if __name__ == "__main__":
