@@ -20,6 +20,7 @@ Core capabilities:
    - By default, focuses on Drupal components (`drupal/*` core, contrib modules, and themes).
    - Deduplicates and consolidates advisories per package (1 line per package to update).
    - Generates a timestamped Markdown report with summary tables and collapsible CVE details.
+   - Also generates one timestamped Markdown report per project (project name slug in the file name).
 """
 
 import argparse
@@ -994,37 +995,26 @@ def perform_auto_update(project_path, original_branch, updates, installed_packag
     }
 
 
-def generate_report(results, drupal_only=True):
+def slugify(value):
     """
-    Generate a comprehensive, structured Markdown report from the audit results.
+    Convert a project name into a filesystem-safe slug (e.g. "CCB - IRF" -> "ccb-irf").
 
-    Report Structure:
-    -----------------
-    1. Header & Metadata (Date, Audited Scope).
-    2. Executive Summary (total projects, vulnerable projects, packages to update).
-    3. Per-Project Details:
-       - Repository & active Branch.
-       - Execution errors if any.
-       - Missing Composer file warnings if any.
-       - Combined Composer command to update all project packages at once.
-       - Clean, consolidated table of packages to update (Package, Installed, Affected, Update Command, Primary Advisory, Link).
-       - Collapsible `<details>` section containing every individual CVE/advisory with links.
-
-    Markdown Table Safety:
-    ----------------------
-    Pipe characters (`|`) in advisory titles or version constraints (e.g. `<3.13|>=4.0`)
-    are escaped as `\\|` to preserve table column alignments.
-
-    :param results: List of project analysis dictionaries.
-    :param drupal_only: Whether the analysis was filtered to Drupal packages only.
-    :return: Path to the generated Markdown file.
+    :param value: Arbitrary string (typically a project name).
+    :return: Lowercase slug made of alphanumerics and dashes.
     """
-    REPORTS_DIR.mkdir(exist_ok=True)
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value).lower()).strip("-")
+    return slug or "project"
 
-    now = datetime.now()
-    report_name = f"report-{now.strftime('%Y-%m-%d-%H-%M-%S')}.md"
-    report_path = REPORTS_DIR / report_name
 
+def build_report_header(results, now, scope_text):
+    """
+    Build the Markdown header and executive summary shared by global and per-project reports.
+
+    :param results: List of project analysis dictionaries covered by the report.
+    :param now: Datetime of the report generation.
+    :param scope_text: Human-readable description of the audited scope.
+    :return: List of Markdown lines.
+    """
     total_projects = len(results)
     projects_with_updates = sum(
         1 for result in results if result.get("updates")
@@ -1033,9 +1023,7 @@ def generate_report(results, drupal_only=True):
         len(result.get("updates", [])) for result in results
     )
 
-    scope_text = "Drupal components (`drupal/*`)" if drupal_only else "All packages"
-
-    lines = [
+    return [
         "# Drupal Security Report",
         "",
         f"Date: `{now.strftime('%Y-%m-%d %H:%M:%S')}`",
@@ -1051,159 +1039,228 @@ def generate_report(results, drupal_only=True):
         "",
     ]
 
-    for result in results:
-        project_name = result["name"]
-        branch = result["branch"]
-        repository = result["repository"]
 
+def build_project_section(result):
+    """
+    Build the Markdown details section for a single project.
+
+    Section Structure:
+    ------------------
+    - Repository & active Branch.
+    - Execution errors if any.
+    - Missing Composer file warnings if any.
+    - Auto-update status if executed.
+    - Combined Composer command to update all project packages at once.
+    - Clean, consolidated table of packages to update (Package, Installed, Affected, Update Command, Primary Advisory, Link).
+    - Collapsible `<details>` section containing every individual CVE/advisory with links.
+
+    Markdown Table Safety:
+    ----------------------
+    Pipe characters (`|`) in advisory titles or version constraints (e.g. `<3.13|>=4.0`)
+    are escaped as `\\|` to preserve table column alignments.
+
+    :param result: Project analysis dictionary.
+    :return: List of Markdown lines.
+    """
+    project_name = result["name"]
+    branch = result["branch"]
+    repository = result["repository"]
+
+    lines = []
+
+    lines.extend(
+        [
+            f"### {project_name}",
+            "",
+            f"- Repository: `{repository}`",
+            f"- Branch: `{branch}`",
+            "",
+        ]
+    )
+
+    # Handle any critical execution/git errors
+    if result.get("error"):
         lines.extend(
             [
-                f"### {project_name}",
+                "#### Error",
                 "",
-                f"- Repository: `{repository}`",
-                f"- Branch: `{branch}`",
+                "```text",
+                result["error"],
+                "```",
                 "",
             ]
         )
+        return lines
 
-        # Handle any critical execution/git errors
-        if result.get("error"):
-            lines.extend(
-                [
-                    "#### Error",
-                    "",
-                    "```text",
-                    result["error"],
-                    "```",
-                    "",
-                ]
-            )
-            continue
-
-        # Handle missing composer.json
-        if not result.get("composer_json_exists"):
-            lines.extend(
-                [
-                    "⚠️ No `composer.json` file found.",
-                    "",
-                ]
-            )
-            continue
-
-        # Handle missing composer.lock
-        if not result.get("composer_lock_exists"):
-            lines.extend(
-                [
-                    "⚠️ No `composer.lock` file found.",
-                    "",
-                ]
-            )
-            continue
-
-        updates = result.get("updates", [])
-
-        # Clean project with no detected vulnerabilities
-        if not updates:
-            lines.extend(
-                [
-                    "✅ No Drupal security updates required.",
-                    "",
-                ]
-            )
-            continue
-
-        # Auto-update status block if executed
-        auto_up = result.get("auto_update_result")
-        if auto_up:
-            if auto_up.get("success"):
-                up_branch = auto_up.get("branch")
-                slack_info = auto_up.get("slack_notification")
-                slack_line = ""
-                if slack_info:
-                    if slack_info.get("success"):
-                        slack_line = "\n> - 💬 **Slack notification:** Sent to channel."
-                    else:
-                        slack_line = f"\n> - ⚠️ **Slack notification failed:** {slack_info.get('error')}"
-
-                lines.extend(
-                    [
-                        f"> 🚀 **Auto-update successful:** Branch `{up_branch}` was created, committed, and pushed to origin.{slack_line}",
-                        "",
-                    ]
-                )
-            else:
-                err_msg = auto_up.get("error", "Unknown error")
-                lines.extend(
-                    [
-                        f"> ❌ **Auto-update failed:** `{err_msg}`",
-                        "",
-                    ]
-                )
-
-        # Combined command for updating all packages at once
-        installed_packages = result.get("installed_packages", {})
-        combined_cmd = get_project_require_command(updates, installed_packages)
-
-        # Table of required package updates
+    # Handle missing composer.json
+    if not result.get("composer_json_exists"):
         lines.extend(
             [
-                "#### Required Security Updates",
+                "⚠️ No `composer.json` file found.",
                 "",
-                "> **Combined require command for this project:**",
-                f"> ```bash\n> {combined_cmd}\n> ```",
-                "",
-                "| Package | Current Version | Affected Versions | Target Version | Composer Command (require) | Primary Advisory | Link |",
-                "|---|---|---|---|---|---|---|",
             ]
         )
+        return lines
 
-        for update in updates:
-            package = update["package"]
-            installed = update["installed_version"]
-            # Escape pipe symbols to prevent breaking markdown tables
-            affected = str(update["affected_versions"]).replace("|", "\\|")
-            target_ver = update.get("target_version") or "-"
-            update_cmd = f"`{get_package_require_command(package, update.get('target_version'), installed_packages)}`"
+    # Handle missing composer.lock
+    if not result.get("composer_lock_exists"):
+        lines.extend(
+            [
+                "⚠️ No `composer.lock` file found.",
+                "",
+            ]
+        )
+        return lines
 
-            count = update["total_advisories"]
-            main_title = str(update["main_title"]).replace("|", "\\|")
-            if count > 1:
-                title_display = f"{main_title} *(+{count - 1} other{'s' if count > 2 else ''} advisory/advisories)*"
-            else:
-                title_display = main_title
+    updates = result.get("updates", [])
 
-            link = update["main_link"] or "-"
-            link_display = f"[View]({link})" if link != "-" else "-"
+    # Clean project with no detected vulnerabilities
+    if not updates:
+        lines.extend(
+            [
+                "✅ No Drupal security updates required.",
+                "",
+            ]
+        )
+        return lines
 
-            lines.append(
-                f"| `{package}` | `{installed}` | `{affected}` | `{target_ver}` | {update_cmd} | {title_display} | {link_display} |"
+    # Auto-update status block if executed
+    auto_up = result.get("auto_update_result")
+    if auto_up:
+        if auto_up.get("success"):
+            up_branch = auto_up.get("branch")
+            slack_info = auto_up.get("slack_notification")
+            slack_line = ""
+            if slack_info:
+                if slack_info.get("success"):
+                    slack_line = "\n> - 💬 **Slack notification:** Sent to channel."
+                else:
+                    slack_line = f"\n> - ⚠️ **Slack notification failed:** {slack_info.get('error')}"
+
+            lines.extend(
+                [
+                    f"> 🚀 **Auto-update successful:** Branch `{up_branch}` was created, committed, and pushed to origin.{slack_line}",
+                    "",
+                ]
+            )
+        else:
+            err_msg = auto_up.get("error", "Unknown error")
+            lines.extend(
+                [
+                    f"> ❌ **Auto-update failed:** `{err_msg}`",
+                    "",
+                ]
             )
 
+    # Combined command for updating all packages at once
+    installed_packages = result.get("installed_packages", {})
+    combined_cmd = get_project_require_command(updates, installed_packages)
+
+    # Table of required package updates
+    lines.extend(
+        [
+            "#### Required Security Updates",
+            "",
+            "> **Combined require command for this project:**",
+            f"> ```bash\n> {combined_cmd}\n> ```",
+            "",
+            "| Package | Current Version | Affected Versions | Target Version | Composer Command (require) | Primary Advisory | Link |",
+            "|---|---|---|---|---|---|---|",
+        ]
+    )
+
+    for update in updates:
+        package = update["package"]
+        installed = update["installed_version"]
+        # Escape pipe symbols to prevent breaking markdown tables
+        affected = str(update["affected_versions"]).replace("|", "\\|")
+        target_ver = update.get("target_version") or "-"
+        update_cmd = f"`{get_package_require_command(package, update.get('target_version'), installed_packages)}`"
+
+        count = update["total_advisories"]
+        main_title = str(update["main_title"]).replace("|", "\\|")
+        if count > 1:
+            title_display = f"{main_title} *(+{count - 1} other{'s' if count > 2 else ''} advisory/advisories)*"
+        else:
+            title_display = main_title
+
+        link = update["main_link"] or "-"
+        link_display = f"[View]({link})" if link != "-" else "-"
+
+        lines.append(
+            f"| `{package}` | `{installed}` | `{affected}` | `{target_ver}` | {update_cmd} | {title_display} | {link_display} |"
+        )
+
+    lines.append("")
+
+    # Collapsible details section for granular advisory breakdown
+    lines.extend(
+        [
+            "<details>",
+            "<summary>Detailed list of all detected advisories for this project</summary>",
+            "",
+        ]
+    )
+    for update in updates:
+        lines.append(f"**`{update['package']}`** ({update['total_advisories']} advisories):")
         lines.append("")
+        for adv in update["all_advisories"]:
+            adv_title = adv["title"]
+            adv_cve = f" - `{adv['cve']}`" if adv.get("cve") else ""
+            adv_link = f" - [Link]({adv['link']})" if adv.get("link") else ""
+            lines.append(f"- {adv_title}{adv_cve}{adv_link}")
+        lines.append("")
+    lines.extend(["</details>", ""])
+    return lines
 
-        # Collapsible details section for granular advisory breakdown
-        lines.extend(
-            [
-                "<details>",
-                "<summary>Detailed list of all detected advisories for this project</summary>",
-                "",
-            ]
-        )
-        for update in updates:
-            lines.append(f"**`{update['package']}`** ({update['total_advisories']} advisories):")
-            lines.append("")
-            for adv in update["all_advisories"]:
-                adv_title = adv["title"]
-                adv_cve = f" - `{adv['cve']}`" if adv.get("cve") else ""
-                adv_link = f" - [Link]({adv['link']})" if adv.get("link") else ""
-                lines.append(f"- {adv_title}{adv_cve}{adv_link}")
-            lines.append("")
-        lines.extend(["</details>", ""])
+
+def generate_report(results, drupal_only=True):
+    """
+    Generate the global Markdown report plus one Markdown report per project.
+
+    All reports share the same timestamp. Per-project reports include the project
+    name slug in their file name (e.g. `2026-10-22-11-33-18-ccb-irf-report.md`), while the
+    global report is named `<timestamp>-global-report.md`. Per-project reports
+    follow the same structure as the global report, restricted to that project.
+
+    :param results: List of project analysis dictionaries.
+    :param drupal_only: Whether the analysis was filtered to Drupal packages only.
+    :return: Tuple (global report path, list of per-project report paths).
+    """
+    REPORTS_DIR.mkdir(exist_ok=True)
+
+    now = datetime.now()
+    timestamp = now.strftime('%Y-%m-%d-%H-%M-%S')
+    scope_text = "Drupal components (`drupal/*`)" if drupal_only else "All packages"
+
+    report_path = REPORTS_DIR / f"{timestamp}-global-report.md"
+    lines = build_report_header(results, now, scope_text)
+    project_report_paths = []
+    used_slugs = set()
+
+    for result in results:
+        section = build_project_section(result)
+        lines.extend(section)
+
+        # Ensure unique file names if two projects share the same slug
+        base_slug = slugify(result["name"])
+        slug = base_slug
+        suffix = 2
+        while slug in used_slugs:
+            slug = f"{base_slug}-{suffix}"
+            suffix += 1
+        used_slugs.add(slug)
+
+        project_report_path = REPORTS_DIR / f"{timestamp}-{slug}-report.md"
+        project_lines = build_report_header([result], now, scope_text) + section
+        with open(project_report_path, "w", encoding="utf-8") as file:
+            file.write("\n".join(project_lines))
+        project_report_paths.append(project_report_path)
 
     with open(report_path, "w", encoding="utf-8") as file:
         file.write("\n".join(lines))
 
-    return report_path
+    return report_path, project_report_paths
 
 
 def analyze_project(project, drupal_only=True, auto_update=False):
@@ -1349,10 +1406,12 @@ def main():
         )
         results.append(result)
 
-    report_path = generate_report(results, drupal_only=drupal_only)
+    report_path, project_report_paths = generate_report(results, drupal_only=drupal_only)
 
     print("")
     print(f"Report generated: {report_path}")
+    for project_report_path in project_report_paths:
+        print(f"Project report generated: {project_report_path}")
 
 
 if __name__ == "__main__":
